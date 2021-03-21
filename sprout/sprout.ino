@@ -67,6 +67,7 @@ void connectToWiFi(int* wifiStatus, const char* ssid, const char* password) {
 }
 
 void reportError(const char* message) {
+  reportValue(&udp, message);
   Serial.println(message);
 }
 
@@ -159,10 +160,10 @@ void sendPM25(WiFiUDP* udp, PM25_AQI_Data* data) {
 
 void setup() {
   Serial.begin(9600);
-  while (!Serial) {
-    ;
+  delay(100);
+  if (Serial) {
+    Serial.println("Serial ready!");
   }
-  Serial.println("Serial ready!");
 
   connectToWiFi(&radioStatus, SSID, WIFI_PASS);
   udp.begin(UDP_SRC_PORT);
@@ -185,7 +186,7 @@ void setup() {
   // This is for the PM2.5 sensor, connected over UART
   Serial1.begin(9600);
   if (! aqi.begin_UART(&Serial1)) {
-    Serial.println("PM 2.5 sensor failed to initialize!");
+    reportError("PM 2.5 sensor failed to initialize!");
     while (1) delay(1000);
   }
 }
