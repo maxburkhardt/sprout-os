@@ -5,9 +5,10 @@
 #include <Adafruit_Sensor.h>
 #include <Adafruit_BME280.h>
 #include <Adafruit_SGP30.h>
-// This is a custom library that exports `ssid` and `pass` variables
+#include <Adafruit_PM25AQI.h>
+// This is a custom library that exports `SSID` and `WIFI_PASS` variables
 // Do something similar (to avoid checking in credentials) or just define
-// `ssid` and `pass` locally.
+// `SSID` and `WIFI_PASS` locally.
 #include <wificreds.h>
 
 #define SEALEVELPRESSURE_HPA (1013.25)
@@ -33,11 +34,23 @@ int readingCount = 0;
 
 Adafruit_SGP30 sgp;
 Adafruit_BME280 bme;
+Adafruit_PM25AQI aqi = Adafruit_PM25AQI();
 BME280_Data bmeEnv;
 SGP30_Data sgpEnv;
+PM25_AQI_Data pm25Env;
 WiFiUDP udp;
 
 void connectToWiFi(int* wifiStatus, const char* ssid, const char* password) {
+  if (WiFi.status() == WL_NO_MODULE) {
+    reportError("WiFi module not present");
+    while(true);
+  } else {
+    Serial.println("WiFi detected.");
+  }
+  String fv = WiFi.firmwareVersion();
+  Serial.print("WiFi firmware version is: ");
+  Serial.println(fv);
+
   while (*wifiStatus != WL_CONNECTED) {
     Serial.print("Attempting to connect to WPA SSID: ");
     Serial.println(ssid);
@@ -59,8 +72,6 @@ void reportError(const char* message) {
 
 void reportValue(WiFiUDP* udp, const char* message) {
   udp->beginPacket(METRICS_IP, METRICS_PORT);
-  Serial.print("Sending packet: ");
-  Serial.println(message);
   udp->write(message);
   udp->endPacket();
 }
@@ -91,6 +102,14 @@ void readSGP30(Adafruit_SGP30* sgp, SGP30_Data* env) {
   env->ethanol = sgp->rawEthanol;
 }
 
+void readPM25(Adafruit_PM25AQI* aqi, PM25_AQI_Data* env) {
+  if (! aqi->read(env)) {
+    reportError("PM 2.5 measurement failed");
+  } else {
+    Serial.println("Successful PM 2.5 measurement");
+  }
+}
+
 void getSGP30Baseline(Adafruit_SGP30* sgp, uint16_t* eCO2_base, uint16_t* TVOC_base) {
   if (! sgp->getIAQBaseline(eCO2_base, TVOC_base)) {
     reportError("Failed to get SGP30 baseline readings");
@@ -113,6 +132,27 @@ void sendBME280(WiFiUDP* udp, BME280_Data* data) {
   char packet[100];
   snprintf(packet, 100, "temperature:%s|g\npressure:%s|g\nhumidity:%s|g", tempString, pressureString, humidityString);
   reportValue(udp, packet);
+}
+
+void sendSGP30(WiFiUDP* udp, SGP30_Data* data) {
+  char packet[100];
+  snprintf(packet, 100, "TVOC:%u|g\neCO2:%u|g\nh2:%u|g\nethanol:%u|g", data->tvoc, data->eco2, data->h2, data->ethanol);
+  reportValue(udp, packet);
+}
+
+void sendPM25(WiFiUDP* udp, PM25_AQI_Data* data) {
+  char standardPacket[100];
+  snprintf(standardPacket, 100, "st_pm10:%u|g\nst_pm25:%u|g\nst_pm100:%u|g", data->pm10_standard, data->pm25_standard, data->pm100_standard);
+  reportValue(udp, standardPacket);
+  char envPacket[100];
+  snprintf(envPacket, 100, "env_pm10:%u|g\nenv_pm25:%u|g\nenv_pm100:%u|g", data->pm10_env, data->pm25_env, data->pm100_env);
+  reportValue(udp, envPacket);
+  char particlesPacket[100];
+  snprintf(particlesPacket, 100, "particles_03um:%u|g\nparticles_05um:%u|g\nparticles_10um:%u|g", data->particles_03um, data->particles_05um, data->particles_10um);
+  reportValue(udp, particlesPacket);
+  char particlesPacket2[100];
+  snprintf(particlesPacket2, 100, "particles_25um:%u|g\nparticles_50um:%u|g\nparticles_100um:%u|g", data->particles_25um, data->particles_50um, data->particles_100um);
+  reportValue(udp, particlesPacket2);
 }
 
 void setup() {
@@ -140,32 +180,19 @@ void setup() {
     while (1) delay(1000);
   }
 
-  if (WiFi.status() == WL_NO_MODULE) {
-    reportError("WiFi module not present");
-    while(true);
-  } else {
-    Serial.println("WiFi detected.");
+  // This is for the PM2.5 sensor, connected over UART
+  Serial1.begin(9600);
+  if (! aqi.begin_UART(&Serial1)) {
+    Serial.println("PM 2.5 sensor failed to initialize!");
+    while (1) delay(1000);
   }
-
-  String fv = WiFi.firmwareVersion();
-  Serial.print("Firmware version is: ");
-  Serial.println(fv);
 }
 
 void loop() {
   // SGP30 measurements
   readSGP30(&sgp, &sgpEnv);
   if (sgpEnv.warm) {
-    Serial.print("TVOC ");
-    Serial.print(sgpEnv.tvoc);
-    Serial.println(" ppb");
-    Serial.print("eCO2 ");
-    Serial.print(sgpEnv.eco2);
-    Serial.println(" ppm");
-    Serial.print("Raw H2 ");
-    Serial.println(sgpEnv.h2);
-    Serial.print("Raw Ethanol ");
-    Serial.println(sgpEnv.ethanol);
+    sendSGP30(&udp, &sgpEnv);
     /*
     if (readingCount % 60 == 0) {
       uint16_t eCO2_base = 0;
@@ -183,25 +210,11 @@ void loop() {
 
   // BME280 measurements
   readBME280(&bme, &bmeEnv);
-  Serial.print("Temperature = ");
-  Serial.print(bmeEnv.temperature);
-  Serial.println(" *C");
-
-  Serial.print("Pressure = ");
-
-  Serial.print(bmeEnv.pressure / 100.0F);
-  Serial.println(" hPa");
-
-  Serial.print("Approx. Altitude = ");
-  Serial.print(bmeEnv.altitude);
-  Serial.println(" m");
-
-  Serial.print("Humidity = ");
-  Serial.print(bmeEnv.humidity);
-  Serial.println(" %");
   sendBME280(&udp, &bmeEnv);
 
-  Serial.println();
+  // PM 2.5 measurements
+  readPM25(&aqi, &pm25Env);
+  sendPM25(&udp, &pm25Env);
   readingCount++;
-  delay(10000);
+  delay(3000);
 }
