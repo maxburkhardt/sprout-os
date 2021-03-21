@@ -102,12 +102,14 @@ void readSGP30(Adafruit_SGP30* sgp, SGP30_Data* env) {
   env->ethanol = sgp->rawEthanol;
 }
 
-void readPM25(Adafruit_PM25AQI* aqi, PM25_AQI_Data* env) {
+bool readPM25(Adafruit_PM25AQI* aqi, PM25_AQI_Data* env) {
   if (! aqi->read(env)) {
-    reportError("PM 2.5 measurement failed");
-  } else {
-    Serial.println("Successful PM 2.5 measurement");
+    reportError("PM 2.5 measurement failed. Trying to reset serial connection...");
+    Serial1.begin(9600);
+    aqi->begin_UART(&Serial1);
+    return false;
   }
+  return true;
 }
 
 void getSGP30Baseline(Adafruit_SGP30* sgp, uint16_t* eCO2_base, uint16_t* TVOC_base) {
@@ -213,8 +215,9 @@ void loop() {
   sendBME280(&udp, &bmeEnv);
 
   // PM 2.5 measurements
-  readPM25(&aqi, &pm25Env);
-  sendPM25(&udp, &pm25Env);
+  if (readPM25(&aqi, &pm25Env)) {
+    sendPM25(&udp, &pm25Env);
+  }
   readingCount++;
-  delay(3000);
+  delay(10000);
 }
