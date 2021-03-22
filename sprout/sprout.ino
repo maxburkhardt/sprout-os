@@ -30,7 +30,6 @@ struct SGP30_Data {
 };
 
 int radioStatus = WL_IDLE_STATUS;
-int readingCount = 0;
 
 Adafruit_SGP30 sgp;
 Adafruit_BME280 bme;
@@ -67,7 +66,6 @@ void connectToWiFi(int* wifiStatus, const char* ssid, const char* password) {
 }
 
 void reportError(const char* message) {
-  reportValue(&udp, message);
   Serial.println(message);
 }
 
@@ -84,9 +82,10 @@ void readBME280(Adafruit_BME280* bme, BME280_Data* env) {
   env->humidity = bme->readHumidity();
 }
 
-void readSGP30(Adafruit_SGP30* sgp, SGP30_Data* env) {
+void readSGP30(Adafruit_SGP30* sgp, SGP30_Data* env, WiFiUDP* udp) {
   if (! sgp->IAQmeasure()) {
     reportError("SGP30 measurement failed");
+    reportValue(udp, "sgp30_failed:1|c");
     return;
   }
   if (sgp->TVOC == 0 && sgp->eCO2 == 400) {
@@ -97,15 +96,17 @@ void readSGP30(Adafruit_SGP30* sgp, SGP30_Data* env) {
   env->eco2 = sgp->eCO2;
   if (! sgp->IAQmeasureRaw()) {
     reportError("SGP30 raw measurement failed");
+    reportValue(udp, "sgp30_raw_failed:1|c");
     return;
   }
   env->h2 = sgp->rawH2;
   env->ethanol = sgp->rawEthanol;
 }
 
-bool readPM25(Adafruit_PM25AQI* aqi, PM25_AQI_Data* env) {
+bool readPM25(Adafruit_PM25AQI* aqi, PM25_AQI_Data* env, WiFiUDP* udp) {
   if (! aqi->read(env)) {
     reportError("PM 2.5 measurement failed. Trying to reset serial connection...");
+    reportValue(udp, "pm25_failed:1|c");
     Serial1.begin(9600);
     aqi->begin_UART(&Serial1);
     return false;
@@ -193,7 +194,7 @@ void setup() {
 
 void loop() {
   // SGP30 measurements
-  readSGP30(&sgp, &sgpEnv);
+  readSGP30(&sgp, &sgpEnv, &udp);
   if (sgpEnv.warm) {
     sendSGP30(&udp, &sgpEnv);
     /*
@@ -208,6 +209,7 @@ void loop() {
     }
     */
   } else {
+    reportValue(&udp, "sgp30_warming:1|c");
     Serial.println("SGP30 is still warming up...");
   }
 
@@ -216,9 +218,10 @@ void loop() {
   sendBME280(&udp, &bmeEnv);
 
   // PM 2.5 measurements
-  if (readPM25(&aqi, &pm25Env)) {
+  if (readPM25(&aqi, &pm25Env, &udp)) {
     sendPM25(&udp, &pm25Env);
   }
-  readingCount++;
-  delay(10000);
+
+  // Report values every 30 seconds
+  delay(30000);
 }
