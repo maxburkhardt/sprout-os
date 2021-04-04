@@ -30,6 +30,7 @@ struct SGP30_Data {
 };
 
 int radioStatus = WL_IDLE_STATUS;
+int measurementCount = 0;
 
 Adafruit_SGP30 sgp;
 Adafruit_BME280 bme;
@@ -37,7 +38,7 @@ Adafruit_PM25AQI aqi = Adafruit_PM25AQI();
 BME280_Data bmeEnv;
 SGP30_Data sgpEnv;
 PM25_AQI_Data pm25Env;
-WiFiUDP udp;
+WiFiUDP Udp;
 
 void connectToWiFi(int* wifiStatus, const char* ssid, const char* password) {
   if (WiFi.status() == WL_NO_MODULE) {
@@ -71,6 +72,12 @@ void reportError(const char* message) {
 
 void reportValue(WiFiUDP* udp, const char* message) {
   udp->beginPacket(METRICS_IP, METRICS_PORT);
+  udp->write(message);
+  udp->endPacket();
+}
+
+void logMessage(WiFiUDP* udp, const char* message) {
+  udp->beginPacket(METRICS_IP, LOGS_PORT);
   udp->write(message);
   udp->endPacket();
 }
@@ -111,6 +118,7 @@ bool readPM25(Adafruit_PM25AQI* aqi, PM25_AQI_Data* env, WiFiUDP* udp) {
     aqi->begin_UART(&Serial1);
     return false;
   }
+  // TODO: do some sanity checking here to prune incorrect, extremely high values
   return true;
 }
 
@@ -128,13 +136,16 @@ void setSGP30Baseline(Adafruit_SGP30* sgp, uint16_t eCO2_base, uint16_t TVOC_bas
 
 void sendBME280(WiFiUDP* udp, BME280_Data* data) {
   char tempString[8];
+  char tempFString[8];
   char pressureString[12];
   char humidityString[8];
+  float temperatureF = (data->temperature * 9.0 / 5.0) + 32.0;
   dtostrf(data->temperature, 0, 2, tempString);
+  dtostrf(temperatureF, 0, 2, tempFString);
   dtostrf(data->pressure, 0, 2, pressureString);
   dtostrf(data->humidity, 0, 2, humidityString);
   char packet[100];
-  snprintf(packet, 100, "temperature:%s|g\npressure:%s|g\nhumidity:%s|g", tempString, pressureString, humidityString);
+  snprintf(packet, 100, "temperature_c:%s|g\ntemperature_f:%s|g\npressure:%s|g\nhumidity:%s|g", tempString, tempFString, pressureString, humidityString);
   reportValue(udp, packet);
 }
 
@@ -167,15 +178,15 @@ void setup() {
   }
 
   connectToWiFi(&radioStatus, SSID, WIFI_PASS);
-  udp.begin(UDP_SRC_PORT);
+  Udp.begin(UDP_SRC_PORT);
 
   if (! sgp.begin()){
     reportError("SGP30 sensor failed to initialize!");
     while (1) delay(1000);
   }
-  // Readings taken 2021-03-21
+  // Readings taken 2021-04-03
   // In the future, these will be saved to flash storage automatically
-  if (! sgp.setIAQBaseline(35496, 36315)) {
+  if (! sgp.setIAQBaseline(35675, 37324)) {
     reportError("Failed to set SGP30 baseline readings");
   }
 
@@ -193,35 +204,39 @@ void setup() {
 }
 
 void loop() {
+  // TODO: check WiFi status & reconnect if disconnected
+
   // SGP30 measurements
-  readSGP30(&sgp, &sgpEnv, &udp);
+  readSGP30(&sgp, &sgpEnv, &Udp);
   if (sgpEnv.warm) {
-    sendSGP30(&udp, &sgpEnv);
-    /*
-    if (readingCount % 60 == 0) {
-      uint16_t eCO2_base = 0;
-      uint16_t TVOC_base = 0;
-      getSGP30Baseline(&sgp, &eCO2_base, &TVOC_base);
-      Serial.print("Baseline values: eC02 ");
-      Serial.print(eCO2_base);
-      Serial.print("; TVOC");
-      Serial.println(TVOC_base);
-    }
-    */
+    sendSGP30(&Udp, &sgpEnv);
   } else {
-    reportValue(&udp, "sgp30_warming:1|c");
+    reportValue(&Udp, "sgp30_warming:1|c");
     Serial.println("SGP30 is still warming up...");
   }
 
   // BME280 measurements
   readBME280(&bme, &bmeEnv);
-  sendBME280(&udp, &bmeEnv);
+  sendBME280(&Udp, &bmeEnv);
 
   // PM 2.5 measurements
-  if (readPM25(&aqi, &pm25Env, &udp)) {
-    sendPM25(&udp, &pm25Env);
+  if (readPM25(&aqi, &pm25Env, &Udp)) {
+    sendPM25(&Udp, &pm25Env);
   }
 
+  // Report baseline values every 2 hours
+  if (measurementCount == 240) {
+    uint16_t eCO2_base = 0;
+    uint16_t TVOC_base = 0;
+    getSGP30Baseline(&sgp, &eCO2_base, &TVOC_base);
+    char baselineReport[100];
+    snprintf(baselineReport, 100, "eCO2 Base: %u, TVOC Base: %u\n", eCO2_base, TVOC_base);
+    logMessage(&Udp, baselineReport);
+    // Reset counter
+    measurementCount = 0;
+  }
+
+  measurementCount++;
   // Report values every 30 seconds
   delay(30000);
 }
