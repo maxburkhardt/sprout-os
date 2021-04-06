@@ -6,6 +6,7 @@
 #include <Adafruit_BME280.h>
 #include <Adafruit_SGP30.h>
 #include <Adafruit_PM25AQI.h>
+#include <Adafruit_seesaw.h>
 // This is a custom library that exports `SSID` and `WIFI_PASS` variables
 // Do something similar (to avoid checking in credentials) or just define
 // `SSID` and `WIFI_PASS` locally.
@@ -29,20 +30,32 @@ struct SGP30_Data {
   uint16_t ethanol;
 };
 
+struct SoilSensor_Data {
+  float temperature;
+  uint16_t capacitance;
+};
+
 int radioStatus = WL_IDLE_STATUS;
 int measurementCount = 0;
 
 Adafruit_SGP30 sgp;
 Adafruit_BME280 bme;
 Adafruit_PM25AQI aqi = Adafruit_PM25AQI();
+Adafruit_seesaw soilSensor;
 BME280_Data bmeEnv;
 SGP30_Data sgpEnv;
 PM25_AQI_Data pm25Env;
+SoilSensor_Data soilEnv;
+
 WiFiUDP Udp;
+
+float celsiusToFahrenheit(float celsius) {
+  return (celsius * 9.0 / 5.0) + 32.0;
+}
 
 void connectToWiFi(int* wifiStatus, const char* ssid, const char* password) {
   if (WiFi.status() == WL_NO_MODULE) {
-    reportError("WiFi module not present");
+    Serial.println("WiFi module not present");
     while(true);
   } else {
     Serial.println("WiFi detected.");
@@ -66,7 +79,8 @@ void connectToWiFi(int* wifiStatus, const char* ssid, const char* password) {
   Serial.println(WiFi.localIP());
 }
 
-void reportError(const char* message) {
+void reportError(WiFiUDP* udp, const char* message) {
+  logMessage(udp, message);
   Serial.println(message);
 }
 
@@ -91,7 +105,7 @@ void readBME280(Adafruit_BME280* bme, BME280_Data* env) {
 
 void readSGP30(Adafruit_SGP30* sgp, SGP30_Data* env, WiFiUDP* udp) {
   if (! sgp->IAQmeasure()) {
-    reportError("SGP30 measurement failed");
+    reportError(udp, "SGP30 measurement failed");
     reportValue(udp, "sgp30_failed:1|c");
     return;
   }
@@ -102,7 +116,7 @@ void readSGP30(Adafruit_SGP30* sgp, SGP30_Data* env, WiFiUDP* udp) {
   env->tvoc = sgp->TVOC;
   env->eco2 = sgp->eCO2;
   if (! sgp->IAQmeasureRaw()) {
-    reportError("SGP30 raw measurement failed");
+    reportError(udp, "SGP30 raw measurement failed");
     reportValue(udp, "sgp30_raw_failed:1|c");
     return;
   }
@@ -112,25 +126,30 @@ void readSGP30(Adafruit_SGP30* sgp, SGP30_Data* env, WiFiUDP* udp) {
 
 bool readPM25(Adafruit_PM25AQI* aqi, PM25_AQI_Data* env, WiFiUDP* udp) {
   if (! aqi->read(env)) {
-    reportError("PM 2.5 measurement failed. Trying to reset serial connection...");
+    reportError(udp, "PM 2.5 measurement failed. Trying to reset serial connection...");
     reportValue(udp, "pm25_failed:1|c");
     Serial1.begin(9600);
     aqi->begin_UART(&Serial1);
     return false;
   }
-  // TODO: do some sanity checking here to prune incorrect, extremely high values
+
+  // Check the returned values and make sure they seem reasonable
+  // Sometimes the sensor returns momentary spikes of extremely high values
+  if (env->pm10_standard > 3000 && env->pm25_standard > 1500 && env->pm100_standard > 1500) {
+    reportValue(&Udp, "pm25_extreme_reading:1|c");
+    return false;
+  }
   return true;
 }
 
-void getSGP30Baseline(Adafruit_SGP30* sgp, uint16_t* eCO2_base, uint16_t* TVOC_base) {
-  if (! sgp->getIAQBaseline(eCO2_base, TVOC_base)) {
-    reportError("Failed to get SGP30 baseline readings");
-  }
+void readSoilSensor(Adafruit_seesaw* ss, SoilSensor_Data* env) {
+  env->temperature = ss->getTemp();
+  env->capacitance = ss->touchRead(0);
 }
 
-void setSGP30Baseline(Adafruit_SGP30* sgp, uint16_t eCO2_base, uint16_t TVOC_base) {
-  if (! sgp->setIAQBaseline(eCO2_base, TVOC_base)) {
-    reportError("Failed to set SGP30 baseline readings");
+void getSGP30Baseline(WiFiUDP* udp, Adafruit_SGP30* sgp, uint16_t* eCO2_base, uint16_t* TVOC_base) {
+  if (! sgp->getIAQBaseline(eCO2_base, TVOC_base)) {
+    reportError(udp, "Failed to get SGP30 baseline readings");
   }
 }
 
@@ -139,7 +158,7 @@ void sendBME280(WiFiUDP* udp, BME280_Data* data) {
   char tempFString[8];
   char pressureString[12];
   char humidityString[8];
-  float temperatureF = (data->temperature * 9.0 / 5.0) + 32.0;
+  float temperatureF = celsiusToFahrenheit(data->temperature);
   dtostrf(data->temperature, 0, 2, tempString);
   dtostrf(temperatureF, 0, 2, tempFString);
   dtostrf(data->pressure, 0, 2, pressureString);
@@ -170,6 +189,17 @@ void sendPM25(WiFiUDP* udp, PM25_AQI_Data* data) {
   reportValue(udp, particlesPacket2);
 }
 
+void sendSoilSensor(WiFiUDP* udp, SoilSensor_Data* data) {
+  char packet[100];
+  float temperatureF = celsiusToFahrenheit(data->temperature);
+  char tempString[8];
+  char tempFString[8];
+  dtostrf(data->temperature, 0, 2, tempString);
+  dtostrf(temperatureF, 0, 2, tempFString);
+  snprintf(packet, 100, "temperature_soil_c:%s|g\ntemperature_soil_f:%s|g\nsoil_capacitance:%u|g", tempString, tempFString, data->capacitance);
+  reportValue(udp, packet);
+}
+
 void setup() {
   Serial.begin(9600);
   delay(100);
@@ -181,30 +211,38 @@ void setup() {
   Udp.begin(UDP_SRC_PORT);
 
   if (! sgp.begin()){
-    reportError("SGP30 sensor failed to initialize!");
+    reportError(&Udp, "SGP30 sensor failed to initialize!");
     while (1) delay(1000);
   }
   // Readings taken 2021-04-03
   // In the future, these will be saved to flash storage automatically
   if (! sgp.setIAQBaseline(35675, 37324)) {
-    reportError("Failed to set SGP30 baseline readings");
+    reportError(&Udp, "Failed to set SGP30 baseline readings");
   }
 
   if (! bme.begin()){
-    reportError("BME280 sensor failed to initialize!");
+    reportError(&Udp, "BME280 sensor failed to initialize!");
     while (1) delay(1000);
   }
 
   // This is for the PM2.5 sensor, connected over UART
   Serial1.begin(9600);
   if (! aqi.begin_UART(&Serial1)) {
-    reportError("PM 2.5 sensor failed to initialize!");
+    reportError(&Udp, "PM 2.5 sensor failed to initialize!");
+    while (1) delay(1000);
+  }
+
+  if (!soilSensor.begin(0x36)) {
+    reportError(&Udp, "Soil sensor failed to initialize!");
     while (1) delay(1000);
   }
 }
 
 void loop() {
-  // TODO: check WiFi status & reconnect if disconnected
+  int wifiStatus = WiFi.status();
+  if (wifiStatus != WL_CONNECTED) {
+    connectToWiFi(&radioStatus, SSID, WIFI_PASS);
+  }
 
   // SGP30 measurements
   readSGP30(&sgp, &sgpEnv, &Udp);
@@ -224,11 +262,15 @@ void loop() {
     sendPM25(&Udp, &pm25Env);
   }
 
+  // Soil measurements
+  readSoilSensor(&soilSensor, &soilEnv);
+  sendSoilSensor(&Udp, &soilEnv);
+
   // Report baseline values every 2 hours
   if (measurementCount == 240) {
     uint16_t eCO2_base = 0;
     uint16_t TVOC_base = 0;
-    getSGP30Baseline(&sgp, &eCO2_base, &TVOC_base);
+    getSGP30Baseline(&Udp, &sgp, &eCO2_base, &TVOC_base);
     char baselineReport[100];
     snprintf(baselineReport, 100, "eCO2 Base: %u, TVOC Base: %u\n", eCO2_base, TVOC_base);
     logMessage(&Udp, baselineReport);
